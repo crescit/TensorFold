@@ -106,6 +106,23 @@ def checkpoint_vision(model_dir: str | Path) -> tuple[dict, int]:
     return config, sum(math.prod(v["shape"]) * max(2, SIZES[v["dtype"]]) for v in tensors.values())
 
 
+def float_headers(model_dir: str | Path) -> dict[str, dict]:
+    """The tower's tensor headers, each a floating-point tensor whose bytes lie inside its file."""
+    from tensorfold.cuda.capacity import SIZES
+    from .qwen_checkpoint import vision_tensors
+
+    sources = vision_tensors(Path(model_dir))
+    for name, (path, info, begin) in sources.items():
+        shape, offsets = info.get("shape", ()), info.get("data_offsets", ())
+        if (info.get("dtype") not in {"BF16", "F16", "F32"} or not shape
+                or any(type(d) is not int or d <= 0 for d in shape) or len(offsets) != 2
+                or any(type(d) is not int for d in offsets) or offsets[0] < 0
+                or offsets[1] - offsets[0] != math.prod(shape) * SIZES[info["dtype"]]
+                or begin + offsets[1] > path.stat().st_size):
+            raise ValueError(f"invalid or unsupported vision tensor range: {name}")
+    return {k: value[1] for k, value in sources.items()}
+
+
 def weight_transform(base, enabled: bool, rank: int):
     def transform(name, info):
         from .qwen_checkpoint import vision_key

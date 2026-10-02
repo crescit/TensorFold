@@ -15,8 +15,15 @@ class ThinkingOffTemplate:
         self.inner = inner
         self.efforts = getattr(inner, "efforts", frozenset())
 
-    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
+    def render(self, messages, *, tools, enable_thinking, extra=None, **images) -> str:
+        if images.get('allow_images'):
+            # Some EXL3 exports ship a text-only Jinja template despite retaining
+            # the native vision tower. Feed its text renderer GLM image markers.
+            messages = [{**message, 'content': ''.join(
+                '<|begin_of_image|><|image|><|end_of_image|>' if part.get('type') == 'image'
+                else part['text'] for part in message['content'])}
+                if isinstance(message.get('content'), list) else message for message in messages]
+        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra, **images)
         return text if enable_thinking else thinking_off(text)
 
 

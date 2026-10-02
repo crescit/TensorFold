@@ -321,7 +321,7 @@ outputs matched at temperatures 0 and 0.8. Hunyuan generated an 11 MB GLB
 in 39.6s while chat ran at 18.14 tok/s. CUDA moderation was loaded, and sampled
 host headroom stayed above 11.64 GiB during cold loading and 14.52 GiB during
 concurrent generation. These are short-prompt measurements. Full 160 Ki prompt
-execution, 128 Ki retained prefixes, and CUDA vision are not qualified.
+execution and 128 Ki retained prefixes are not qualified.
 
 80 focused CPU/CUDA tests cover admission, dense EXL3, one-rank drafting and
 cached/fresh equality. The deployment lifecycle and raw hardware evidence are
@@ -329,3 +329,21 @@ in [ml-infra](https://github.com/crescit/ml-infra/blob/fix_tts/docs/benchmarks/t
 Its external host-memory guard and companion service ownership are distinct
 from TensorFold's startup memory admission. Select an appropriate reserve for
 the actual companion workload.
+
+
+`--vision` also supports the full EXL3 checkpoint on one rank. The loader
+materializes only the canonical vision matrices into a 1.05 GiB BF16 CUDA
+tower, excludes unused floating-point QKV duplicates, and accounts for a
+conservative 4 GiB image workspace at startup. Image prompts bypass retained
+language prefix snapshots; DFlash2 receives the image-conditioned taps.
+Native GLM image markers work with exports that carry a text-only template.
+Install `tensorfold[vision]` (transformers >=5.17 and Pillow).
+
+The same Spark passed shape/color/text recognition, exact serial/drafted
+image-token comparisons at temperatures 0 and 0.8, four 2048×2048 image
+inputs within a 4096 visual-token budget, and an image request during real
+Hunyuan generation. Sampled available memory stayed above 9.38 GiB during
+cold companion loading, 9.67 GiB for repeated large-image input, and 10.89 GiB
+for simultaneous mesh/chat/image requests. These qualify the tested short
+prompts and mesh settings, not full-context image conversations.
+[Vision qualification and raw evidence](https://github.com/crescit/ml-infra/blob/fix_tts/docs/benchmarks/tensorfold-glm-160k-vision-20261002T061930Z.md).

@@ -341,11 +341,13 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 # -- prefill ----------------------------------------------------------------------------------------------------
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None) -> int:
+            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, vision=None) -> int:
     """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state."""
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
+    if vision is not None and (resume is not None or keep_at is not None):
+        raise ValueError("image prompts require a fresh cache and keep no prompt state")
     w, st, b = e.w, e.st, e.pbuf
     use_mtp = mtp and w.mtp is not None
     begin = 0
@@ -375,7 +377,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         R = len(chunk)
         point = keep_at - start if keep_at is not None else 0
         cut = Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) if 0 < point < R else None
-        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut).clone()
+        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut,
+                       images=_images(vision, start, R)).clone()
         e.last_hidden = b.fnormed[R - 1:R].clone()
         if 0 < point <= R:
             rec = cut.rec if cut is not None else st.rec[st.cur[0] if st.cur else 0].clone()
@@ -394,8 +397,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         if use_mtp:
             nxt = list(prompt[start + 1:start + R + 1])
             if nxt:
-                with prof.timed("mtp absorb"):
-                    _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
+                with prof.timed("mtp absorb"):      # the head reads each row with the token after it
+                    _absorb_rows(e, b.fnormed[:len(nxt)], nxt, _images(vision, start + 1, len(nxt)))
         with prof.timed("commit"):
             commit(w, st, b, R, R)
     if kept is not None:
@@ -409,12 +412,22 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     return first
 
 
-def _absorb_rows(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int]) -> None:
+def _absorb_rows(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int], images=None) -> None:
     """A prompt's rows into the MTP cache through the prefill buffers (the prefill arithmetic, like the prompt)."""
 
     st = e.st
-    mtp_forward(e.w, st, e.pbuf, next_tokens, hidden)
+    mtp_forward(e.w, st, e.pbuf, next_tokens, hidden, images=images)
     st.set_mtp_len(st.mtp_len + len(next_tokens))
+
+
+def _images(vision, start: int, rows: int):
+    """Writes an image prompt's features over prompt rows start .. start + rows once they are embedded, or None."""
+
+    if vision is None or not vision.rows[0] < start + rows or vision.rows[-1] < start:     # a chunk of text only
+        return None
+    from tensorfold.vision.glm_cuda import replace_rows
+
+    return lambda x, copies: replace_rows(x, vision, start, start + rows, copies)
 
 
 # -- decode loops -----------------------------------------------------------------------------------------------
@@ -464,8 +477,8 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
         out.append(tok)
-        if on_tokens is not None:
-            on_tokens([tok])
+        if on_tokens is not None and on_tokens([tok]):          # True: the caller stops the reply here
+            break
     _sync(w)
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
 
@@ -529,12 +542,11 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        halt = on_tokens is not None and on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["forward"] += t1 - t0
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
-        if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
+        if halt or len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
             break
         t4 = time.perf_counter()
         depth = min(policy.next(len(drafts), keep - 1), count - len(out))
@@ -588,12 +600,13 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        halt = on_tokens is not None and on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
+        if halt:
+            break
         depth = min(policy.next(len(drafts), keep - 1), count - len(out))
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
