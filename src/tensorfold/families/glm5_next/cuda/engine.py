@@ -110,7 +110,7 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                 prefill_rows: int | None = None) -> None:
+                 prefill_rows: int | None = None, world: int = 2) -> None:
         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
 
         import torch
@@ -127,31 +127,45 @@ class GlmEngine:
         torch.cuda.set_device(0)
         self.torch = torch
         self.rank = rank
+        self.world = self.tp = int(world)
+        if self.world not in (1, 2) or not 0 <= rank < self.world:
+            raise ValueError("GLM world/rank must be (1,0), (2,0) or (2,1)")
         self.policy = "0" if serial_only else policy
         self.serial_only = serial_only
-        self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
+        from .solo import LocalComm
+        self.comm = comm if comm is not None else LocalComm() if self.world == 1 else NCCL(rank, 2, master, port)
         self.comm.barrier()
         cfg = Config.read(model_dir)
+        if self.world == 2:
+            import json
+            raw = json.loads((Path(model_dir) / "config.json").read_text())
+            if (raw.get("quantization_config") or {}).get("codebook") == "mul1":
+                raise ValueError("Full mul1 GLM checkpoint requires --tp 1 in this candidate")
         # Without --context the window stays dense, attending every key without indexer work.
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         from . import LATENT
 
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
-        weights_estimate = split_weights(rule)
+        from .solo import weight_transform, validate
+        if self.world == 1:
+            validate(model_dir)
+        weights_estimate = weight_transform(cfg.layers) if self.world == 1 else split_weights(rule)
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
+        prefill_rows = int(os.environ.get("TF_GLM_PREFILL_ROWS", "512" if self.world == 1 else str(PREFILL_ROWS))) if prefill_rows is None else int(prefill_rows)
+        if prefill_rows < 64 or prefill_rows > 8192 or prefill_rows % 64:
+            raise ValueError("GLM prefill rows must be a multiple of 64 between 64 and 8192")
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
-                                   lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
-                                                             latent=LATENT, mtp=self.mtp_on),
-                                   weights_estimate, rank=rank, world=2, gather=self._gather_ints,
-                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
-                                   draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
+                                   lambda text: mla_geometry(text, self.world, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
+                                                             latent=LATENT, mtp=self.mtp_on, prefill_rows=prefill_rows),
+                                   weights_estimate, rank=rank, world=self.world, gather=self._gather_ints,
+                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, self.world),
+                                   draft_geometry=lambda text: dflash2_geometry(text, self.world, MAX_ROWS, ring=DRAFT_RING))
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
-        prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                 prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
@@ -159,12 +173,12 @@ class GlmEngine:
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
         both = self._gather_ints(mine + [spare >> 20])
-        if both[0][:-1] != both[1][:-1]:
+        if any(row[:-1] != both[0][:-1] for row in both):
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
-        self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+        self.cache_bytes = min(row[-1] for row in both) << 20
         plan["kept_bytes"] = self.cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
             plan[key] = plan[key] + self.cache_bytes
@@ -175,8 +189,14 @@ class GlmEngine:
             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
                              "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
-        w = load(model_dir, rank=rank, mtp=self.mtp_on)
-        w.comm = self.comm
+        if self.world == 1:
+            if self.mtp_on:
+                raise ValueError("TP=1 full EXL3 uses DFlash2 or serial; set TF_GLM_MTP=0")
+            from .solo import load as load_solo
+            w = load_solo(model_dir)
+        else:
+            w = load(model_dir, rank=rank, mtp=self.mtp_on)
+        w.comm = None if self.world == 1 else self.comm
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
         self.comm.barrier()
         self.w = w
@@ -194,6 +214,14 @@ class GlmEngine:
         if self.drafter is not None:
             self.drafter.capture()
         self.costs = self._calibrate()
+        # Warmup's temporary projections and split-K buffers must not occupy
+        # the companion reserve in the CUDA caching allocator.
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_reserved()
+        torch.cuda.empty_cache()
+        if rank == 0:
+            print(f"[tensorfold] warmup allocator released {(before - torch.cuda.memory_reserved()) / 2**30:.2f} GiB; "
+                  f"live CUDA tensors {torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
         if rank == 0:
             c = self.costs
             print(f"[tensorfold] drafter timings (ms, fastest of 7): {c['timed']}", flush=True)
@@ -268,9 +296,9 @@ class GlmEngine:
                 back()
         names = list(best)
         mine = torch.tensor([best[n] for n in names], dtype=torch.float32, device="cuda")
-        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device="cuda")
+        got = torch.empty((self.world * mine.numel(),), dtype=torch.float32, device="cuda")
         self.comm.all_gather(mine, got)
-        both = dict(zip(names, got.view(2, -1).max(dim=0).values.tolist()))
+        both = dict(zip(names, got.view(self.world, -1).max(dim=0).values.tolist()))
         e.reset()
         if self.drafter is not None:
             self.drafter.reset()
@@ -288,9 +316,9 @@ class GlmEngine:
     def _gather_ints(self, values: list[int]) -> list[list[int]]:
         torch = self.torch
         mine = torch.tensor(values, dtype=torch.int32, device="cuda")
-        got = torch.empty((2 * len(values),), dtype=torch.int32, device="cuda")
+        got = torch.empty((self.world * len(values),), dtype=torch.int32, device="cuda")
         self.comm.all_gather(mine, got)
-        return [got[:len(values)].tolist(), got[len(values):].tolist()]
+        return got.view(self.world, len(values)).tolist()
 
     # the idle doorbell: rank 1 waits for each request on the rendezvous store (no store: no doorbell), not in NCCL
     def _store(self):
@@ -324,12 +352,12 @@ class GlmEngine:
 
         torch = self.torch
         n = torch.tensor([len(values) if self.rank == 0 else 0], dtype=torch.int32, device="cuda")
-        got = torch.empty((2,), dtype=torch.int32, device="cuda")
+        got = torch.empty((self.world,), dtype=torch.int32, device="cuda")
         self.comm.all_gather(n, got)
         count = int(got[0].item())
         buf = (torch.tensor(values, dtype=torch.int32, device="cuda") if self.rank == 0
                else torch.zeros((count,), dtype=torch.int32, device="cuda"))
-        allv = torch.empty((2 * count,), dtype=torch.int32, device="cuda")
+        allv = torch.empty((self.world * count,), dtype=torch.int32, device="cuda")
         self.comm.all_gather(buf, allv)
         return [int(v) for v in allv[:count].tolist()]
 
@@ -548,10 +576,10 @@ class GlmEngine:
     def _gather_floats(self, values: list[float]) -> list[list[float]]:
         torch = self.torch
         mine = torch.tensor(values, dtype=torch.float32, device="cuda")
-        got = torch.empty((2 * len(values),), dtype=torch.float32, device="cuda")
+        got = torch.empty((self.world * len(values),), dtype=torch.float32, device="cuda")
         self.comm.all_gather(mine, got)
         width = len(values)
-        return [[float(item) for item in got[:width].tolist()], [float(item) for item in got[width:].tolist()]]
+        return got.view(self.world, width).tolist()
 
     def follow(self) -> None:
         """Rank 1: mirror every request rank 0 serves, forever."""

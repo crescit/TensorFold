@@ -197,13 +197,16 @@ def test_policies_and_the_request_header():
         assert (parts[2] << 62) | (parts[1] << 31) | parts[0] == seed
 
 
-def test_family_has_a_mac_engine_and_cuda_needs_two_ranks(tmp_path):
+def test_family_has_a_mac_engine_and_cuda_accepts_one_or_two_ranks(tmp_path, monkeypatch):
     from tensorfold.families import glm5_next
 
     assert glm5_next.MODEL_TYPES == ("glm5_next",) and callable(glm5_next.load)
     assert glm5_next.CUDA_APP.__name__ == "GlmApp"
-    with pytest.raises(ValueError, match="two GPUs"):
-        glm5_next.cuda_engine(tmp_path, tp=1)
+    from tensorfold.families.glm5_next.cuda import engine
+    monkeypatch.setattr(engine, "GlmEngine", lambda path, **kw: kw)
+    assert glm5_next.cuda_engine(tmp_path, tp=1)["world"] == 1
+    with pytest.raises(ValueError):
+        glm5_next.cuda_engine(tmp_path, tp=3)
     with pytest.raises(ValueError, match="--master"):
         glm5_next.cuda_engine(tmp_path, tp=2, rank=0, master="")
 

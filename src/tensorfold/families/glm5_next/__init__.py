@@ -47,7 +47,7 @@ def check(model_dir: str | Path) -> None:
         # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable)
         found = config.get("quantization_config") or config.get("quantization") or {}
         got = {k: found.get(k) for k in EXL3_VARIANT}
-        if {k: (int(v) if k == "bits" and v is not None else v) for k, v in got.items()} != EXL3_VARIANT:
+        if found.get("codebook") != "mul1" and {k: (int(v) if k == "bits" and v is not None else v) for k, v in got.items()} != EXL3_VARIANT:
             raise ValueError(f"GLM-5.3-Flash's CUDA engine reads EXL3 checkpoints with 4-bit mcg-codebook routed "
                              f"experts and BF16 elsewhere ({MODELS[1]}); this one has "
                              + ", ".join(f"{k} {v}" for k, v in got.items()) + f". {OWN_MODEL_HELP}")
@@ -87,6 +87,10 @@ def check(model_dir: str | Path) -> None:
                 and not has_mtp(model_dir)):
             print(f"[tensorfold] this checkpoint has no MTP layer: decoding without MTP drafts ({MODELS[0]} has "
                   f"one)", flush=True)
+        return
+    if method == "exl3" and found.get("codebook") == "mul1":
+        print("[tensorfold] full mul1 EXL3 checkpoint: serve on one GPU with --tp 1 and TF_GLM_MTP=0 "
+              "(docs/recipes/glm-5.3-flash.md)", flush=True)
         return
     print("[tensorfold] GLM-5.3-Flash runs on two NVIDIA GPUs with 128 GB each (two DGX Sparks): pull it on both "
           "and serve with --tp 2 on both (docs/recipes/glm-5.3-flash.md)", flush=True)
@@ -206,10 +210,9 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
     """Build the two-rank engine with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
 
-    if int(tp) != 2:
-        raise ValueError("GLM-5.3-Flash needs two GPUs, one per machine: run the same `tensorfold serve` command "
-                         "with --tp 2 --rank R --master ADDRESS on both (rank 1 first)")
-    if not master:
+    if int(tp) not in (1, 2):
+        raise ValueError("GLM-5.3-Flash supports --tp 1 or --tp 2")
+    if int(tp) == 2 and not master:
         raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
     from .cuda.engine import DEFAULT_POLICY, DFLASH_POLICY, GlmEngine
 
@@ -221,7 +224,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         policy = str(int(mtp_drafts))
     return GlmEngine(Path(model_dir), rank=int(rank), master=master, port=int(master_port), policy=policy,
                      drafter=Path(drafter) if drafter and not no_drafts else None,
-                     context=options.get("context"), context_explicit=options.get("context_explicit"),
+                     world=int(tp), context=options.get("context"), context_explicit=options.get("context_explicit"),
                      serial_only=bool(no_drafts))
 
 

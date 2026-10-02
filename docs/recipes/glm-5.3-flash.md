@@ -44,6 +44,25 @@ The expert decoder and BF16 target matmul keep row arithmetic fixed. A quantized
 propose drafts, but target verification retains the BF16 head. EXL3 speed, capacity and long-context
 qualification are TBD [release-0.3.5].
 
+#### Dense projections from an EXL3 pack
+
+The checkpoint quantizes the routed experts only: attention, the shared experts, the three dense MLPs and the head
+stay BF16, about 9.7 GiB a rank that every decode round reads. `TF_GLM_DENSE_EXL3` names one or more safetensors
+files (`:`-separated) holding EXL3 groups for some of those matrices under the checkpoint's own module names
+(`<module>.trellis`, `suh`, `svh`, and `mul1` or `mcg`), for instance the non-expert groups of
+`turboderp/GLM-5.3-Flash-exl3`, whose KDA `qkv_proj` is cut back into `q_proj` / `k_proj` / `v_proj`. Each matrix a
+pack holds runs on `tensorfold.cuda.exl3`'s row-invariant `Exl3Linear` (the decode kernel up to 128 rows, the prompt
+GEMM above); the others keep the BF16 path. A rank takes the tiles its BF16 twin's split rule gives it (output
+columns for q/k/v, q_b, gate and up; input rows for o and down; whole for q_a and kv_a; its vocabulary columns for the
+head), so the ranks' all-reduce returns the full layer's output. A pack is lossy like any EXL3 weight, and a pack that
+holds `lm_head` replaces the BF16 head for verification too; leave the head out to keep it.
+
+Measured on two DGX Sparks with a pack of attention and shared experts at 4 bpw, dense MLPs at 5 and the head at 6
+(MiaAI-Lab's GLM-5.3-Flash TensorFold recipe, whose FP8 dense weights serve the matrices the pack lacks; sparkDash,
+1 stream, prose / code / structured): FP8 51.4 / 116.1 / 99.7 tok/s, the pack 66.8 / 122.9 / 107.1. HumanEval
+(164 problems x 5 samples) 96.3% against 96.4% with FP8; a 68k-token prompt filled in ~40 s against 42.5 s with
+`TF_GLM_PREFILL_ROWS=4096`, which amortizes the per-chunk weight unpack over twice the rows.
+
 ### Draft policies
 
 For the affine checkpoint with its MTP head loaded, the default `auto` policy uses MTP for sampled requests.
@@ -273,3 +292,40 @@ Use a separate fp32 reference for quality checks, with TF32 disabled on that ref
 Use the [public benchmark command](README.md#measurements) with the server above. Retain model and
 runtime revisions with every run. Decode rate, cold/resumed first-token latency and peak memory are
 TBD [release-0.3.5]. Record the selected drafter policy with the result.
+
+
+## Full EXL3 on one DGX Spark
+
+The CUDA TP=1 loader supports the full Turboderp `mul1` EXL3 checkpoint,
+including 2-bit routed experts, mixed dense projections, fused QKV/conv and
+its 5-bit vocabulary head. This path does not split tensors across ranks.
+Use DFlash2 or `--no-drafts`; the checkpoint MTP layer is not supported on TP=1.
+
+```bash
+TF_GLM_MTP=0 TF_GLM_PREFILL_ROWS=512 TF_GLM_CACHE_GIB=0.25 \
+TENSORFOLD_MEMORY_RESERVE_GIB=20 tensorfold serve /models/GLM-5.3-Flash-exl3-2.05bpw \
+    --backend cuda --tp 1 --parallel 1 --context 163840 \
+    --drafter /models/GLM-5.3-Flash-DFlash2 --name glm-5.3-flash
+```
+
+Prefill chunk size controls temporary buffers independently of the context
+window, and feeds admission geometry. Header validation runs before target
+weights are allocated. The loader reads experts directly in their quantized
+layout; it does not materialize full floating-point expert matrices.
+
+One GB10 was qualified with target revision
+`51058cd551c7e570d87bd32a4adee720edce2349` and drafter revision
+`bf582e4eacc1810f76656d1811693ff6c6737d2a`. Three thinking-off 256-token
+streams measured 33.00–34.59 tok/s (median 34.16); serial and drafted 64-token
+outputs matched at temperatures 0 and 0.8. Hunyuan generated an 11 MB GLB
+in 39.6s while chat ran at 18.14 tok/s. CUDA moderation was loaded, and sampled
+host headroom stayed above 11.64 GiB during cold loading and 14.52 GiB during
+concurrent generation. These are short-prompt measurements. Full 160 Ki prompt
+execution, 128 Ki retained prefixes, and CUDA vision are not qualified.
+
+80 focused CPU/CUDA tests cover admission, dense EXL3, one-rank drafting and
+cached/fresh equality. The deployment lifecycle and raw hardware evidence are
+in [ml-infra](https://github.com/crescit/ml-infra/blob/fix_tts/docs/benchmarks/tensorfold-glm-160k-coexistence-20261002T052609Z.md).
+Its external host-memory guard and companion service ownership are distinct
+from TensorFold's startup memory admission. Select an appropriate reserve for
+the actual companion workload.
